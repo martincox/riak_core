@@ -171,6 +171,9 @@
 
 -define(NUM_KEYS_REQUIRED, 1000).
 
+-define(SHA_LENGTH, 6).
+-define(EPOCH_LENGTH, 4).
+
 -type tree_id_bin() :: <<_:176>>.
 -type segment_bin() :: <<_:256, _:_*8>>.
 -type bucket_bin()  :: <<_:320>>.
@@ -945,7 +948,7 @@ snapshot(State) ->
 
 -spec multi_select_segment(hashtree(), list('*'|integer()), select_fun(T))
                           -> [{integer(), T}].
-multi_select_segment(#state{id=Id, itr=Itr}, Segments, F) ->
+multi_select_segment(#state{id=Id, itr=Itr} = State, Segments, F) ->
     [First | Rest] = Segments,
     IS1 = #itr_state{itr=Itr,
                      id=Id,
@@ -961,7 +964,7 @@ multi_select_segment(#state{id=Id, itr=Itr}, Segments, F) ->
                    encode(Id, First, <<>>)
            end,
     IS2 = try
-              iterate(iterator_move(Itr, Seek), IS1)
+              iterate(iterator_move(Itr, Seek), IS1, State)
           after
               %% Always call prefetch stop to ensure the iterator
               %% is safe to use in the compare.  Requires
@@ -1000,11 +1003,11 @@ iterator_move(Itr, Seek) ->
     end.
 
 -spec iterate({'error','invalid_iterator'} | {'ok',binary(),binary()},
-              #itr_state{}) -> #itr_state{}.
+              #itr_state{}, #state{}) -> #itr_state{}.
 
 %% Ended up at an invalid_iterator likely due to encountering a missing dirty
 %% segment - e.g. segment dirty, but removed last entries for it
-iterate({error, invalid_iterator}, IS=#itr_state{current_segment='*'}) ->
+iterate({error, invalid_iterator}, IS=#itr_state{current_segment='*'}, _State) ->
     IS;
 iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
                                                  id=Id,
@@ -1012,7 +1015,7 @@ iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
                                                  remaining_segments=Segments,
                                                  acc_fun=F,
                                                  segment_acc=Acc,
-                                                 final_acc=FinalAcc}) ->
+                                                 final_acc=FinalAcc}, State) ->
     case Segments of
         [] ->
             IS;
@@ -1024,7 +1027,7 @@ iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
                                remaining_segments=Remaining,
                                segment_acc=[],
                                final_acc=[{CurSeg, F(Acc)} | FinalAcc]},
-            iterate(iterator_move(Itr, Seek), IS2)
+            iterate(iterator_move(Itr, Seek), IS2, State)
     end;
 iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                                   id=Id,
@@ -1032,7 +1035,7 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                                   remaining_segments=Segments,
                                   acc_fun=F,
                                   segment_acc=Acc,
-                                  final_acc=FinalAcc}) ->
+                                  final_acc=FinalAcc}, State) ->
     {SegId, Seg, _} = safe_decode(K),
     Segment = case CurSeg of
                   '*' ->
@@ -1040,6 +1043,7 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                   _ ->
                       CurSeg
               end,
+    KVAcc = maybe_expire_value(K, V, State),
     case {SegId, Seg, Segments, IS#itr_state.prefetch} of
         {bad, -1, _, _} ->
             %% Non-segment encountered, end traversal
@@ -1047,25 +1051,25 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
         {Id, Segment, _, _} ->
             %% Still reading existing segment
             IS2 = IS#itr_state{current_segment=Segment,
-                               segment_acc=[{K,V} | Acc],
+                               segment_acc=KVAcc ++ Acc,
                                prefetch=true},
-            iterate(iterator_move(Itr, prefetch), IS2);
+            iterate(iterator_move(Itr, prefetch), IS2, State);
         {Id, _, [Seg|Remaining], _} ->
             %% Pointing at next segment we are interested in
             IS2 = IS#itr_state{current_segment=Seg,
                                remaining_segments=Remaining,
-                               segment_acc=[{K,V}],
+                               segment_acc=KVAcc,
                                final_acc=[{Segment, F(Acc)} | FinalAcc],
                                prefetch=true},
-            iterate(iterator_move(Itr, prefetch), IS2);
+            iterate(iterator_move(Itr, prefetch), IS2, State);
         {Id, _, ['*'], _} ->
             %% Pointing at next segment we are interested in
             IS2 = IS#itr_state{current_segment=Seg,
                                remaining_segments=['*'],
-                               segment_acc=[{K,V}],
+                               segment_acc=KVAcc,
                                final_acc=[{Segment, F(Acc)} | FinalAcc],
                                prefetch=true},
-            iterate(iterator_move(Itr, prefetch), IS2);
+            iterate(iterator_move(Itr, prefetch), IS2, State);
         {Id, _, [NextSeg | Remaining], true} ->
             %% Pointing at uninteresting segment, but need to halt the
             %% prefetch to ensure the iterator can be reused
@@ -1076,7 +1080,7 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                                prefetch=true}, % will be after second move
             _ = iterator_move(Itr, prefetch_stop), % ignore the pre-fetch,
             Seek = encode(Id, NextSeg, <<>>),      % and risk wasting a reseek
-            iterate(iterator_move(Itr, Seek), IS2);% to get to the next segment
+            iterate(iterator_move(Itr, Seek), IS2, State);% to get to the next segment
         {Id, _, [NextSeg | Remaining], false} ->
             %% Pointing at uninteresting segment, seek to next interesting one
             Seek = encode(Id, NextSeg, <<>>),
@@ -1084,7 +1088,7 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                                remaining_segments=Remaining,
                                segment_acc=[],
                                final_acc=[{Segment, F(Acc)} | FinalAcc]},
-            iterate(iterator_move(Itr, Seek), IS2);
+            iterate(iterator_move(Itr, Seek), IS2, State);
         {_, _, _, true} ->
             %% Done with traversal, but need to stop the prefetch to
             %% ensure the iterator can be reused. The next operation
@@ -1096,6 +1100,34 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
             %% Done with traversal
             IS
     end.
+
+%% The value may have been encoded with an hash and expiry epoch. In that latter
+%% case, we take the epoch and check if it has elapsed. Otherwise, we return the
+%% KV pair and add it to the accumulator as normal.
+%%
+%% The inclusion of an expiry epoch enables a disjoin between the hashtree and other
+%% components when expiring keys; the backend for example. Both can expire keys as 
+%% per their designated epoch without the need for coordination between them.
+maybe_expire_value(K, <<Hash:?SHA_LENGTH/binary, ExpiryEpoch:?EPOCH_LENGTH/binary>>, State) ->
+    Now = now_epoch(),
+    do_expire_value(K, Hash, State, ExpiryEpoch, Now);
+maybe_expire_value(K, Hash, _State) ->
+    [{K, Hash}].
+
+%% Check if an expiry epoch has elapsed. If it has we need to discard the entry from
+%% the tree. We check this because the KV may have been expired elsewhere, but is
+%% orphaned in the tree until a rebuild takes place.
+do_expire_value(K, _V, State, ExpiryEpoch, Now) when Now >= ExpiryEpoch ->
+    delete(K, State),
+    [];
+%% If it has not expired, we can return the KV as normal and add it to the acc.
+do_expire_value(K, <<Hash:?SHA_LENGTH/binary, _ExpiryEpoch:?EPOCH_LENGTH/binary>>, _State, _ExpiryEpoch, _Now) ->
+    [{K, Hash}].
+
+now_epoch() ->
+    {M, S, _} = os:timestamp(),
+    Now = M * 1000000 + S,
+    Now.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% level-by-level exchange (BFS instead of DFS)
