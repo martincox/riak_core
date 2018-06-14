@@ -210,7 +210,8 @@
                 write_buffer       :: [{put, binary(), binary()} |
                                        {delete, binary()}],
                 write_buffer_count :: integer(),
-                dirty_segments     :: hashtree_array()
+                dirty_segments     :: hashtree_array(),
+                itr_filter_fun     :: function()
                }).
 
 -record(itr_state, {itr                :: term(),
@@ -258,6 +259,7 @@ new({Index,TreeId}, LinkedStore, Options) ->
     NumSegments = proplists:get_value(segments, Options, ?NUM_SEGMENTS),
     Width = proplists:get_value(width, Options, ?WIDTH),
     MemLevels = proplists:get_value(mem_levels, Options, ?MEM_LEVELS),
+    ItrFilterFun = proplists:get_value(itr_filter_fun, Options, undefined),
     NumLevels = erlang:trunc(math:log(NumSegments) / math:log(Width)) + 1,
     State = #state{id=encode_id(TreeId),
                    index=Index,
@@ -270,7 +272,8 @@ new({Index,TreeId}, LinkedStore, Options) ->
                    next_rebuild=full,
                    write_buffer=[],
                    write_buffer_count=0,
-                   tree=dict:new()},
+                   tree=dict:new(),
+                   itr_filter_fun=ItrFilterFun},
     State2 = share_segment_store(State, LinkedStore),
     State2.
 
@@ -1015,7 +1018,8 @@ iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
                                                  remaining_segments=Segments,
                                                  acc_fun=F,
                                                  segment_acc=Acc,
-                                                 final_acc=FinalAcc}, State) ->
+                                                 final_acc=FinalAcc}, 
+        State = #state{itr_filter_fun = ItrFilterFun}) ->
     case Segments of
         [] ->
             IS;
@@ -1035,7 +1039,8 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                                   remaining_segments=Segments,
                                   acc_fun=F,
                                   segment_acc=Acc,
-                                  final_acc=FinalAcc}, State) ->
+                                  final_acc=FinalAcc},
+                                  State = #state{itr_filter_fun = ItrFilterFun}) ->
     {SegId, Seg, _} = safe_decode(K),
     Segment = case CurSeg of
                   '*' ->
@@ -1043,7 +1048,7 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                   _ ->
                       CurSeg
               end,
-    KVAcc = maybe_expire_value(K, V, State),
+    KVAcc = ItrFilterFun(K, V, State),
     case {SegId, Seg, Segments, IS#itr_state.prefetch} of
         {bad, -1, _, _} ->
             %% Non-segment encountered, end traversal
@@ -1100,34 +1105,6 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
             %% Done with traversal
             IS
     end.
-
-%% The value may have been encoded with an hash and expiry epoch. In that latter
-%% case, we take the epoch and check if it has elapsed. Otherwise, we return the
-%% KV pair and add it to the accumulator as normal.
-%%
-%% The inclusion of an expiry epoch enables a disjoin between the hashtree and other
-%% components when expiring keys; the backend for example. Both can expire keys as 
-%% per their designated epoch without the need for coordination between them.
-maybe_expire_value(K, <<Hash:?SHA_LENGTH/binary, ExpiryEpoch:?EPOCH_LENGTH/binary>>, State) ->
-    Now = now_epoch(),
-    do_expire_value(K, Hash, State, ExpiryEpoch, Now);
-maybe_expire_value(K, Hash, _State) ->
-    [{K, Hash}].
-
-%% Check if an expiry epoch has elapsed. If it has we need to discard the entry from
-%% the tree. We check this because the KV may have been expired elsewhere, but is
-%% orphaned in the tree until a rebuild takes place.
-do_expire_value(K, _V, State, ExpiryEpoch, Now) when Now >= ExpiryEpoch ->
-    delete(K, State),
-    [];
-%% If it has not expired, we can return the KV as normal and add it to the acc.
-do_expire_value(K, <<Hash:?SHA_LENGTH/binary, _ExpiryEpoch:?EPOCH_LENGTH/binary>>, _State, _ExpiryEpoch, _Now) ->
-    [{K, Hash}].
-
-now_epoch() ->
-    {M, S, _} = os:timestamp(),
-    Now = M * 1000000 + S,
-    Now.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% level-by-level exchange (BFS instead of DFS)
