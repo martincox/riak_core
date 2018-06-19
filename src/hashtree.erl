@@ -1019,7 +1019,7 @@ iterate({error, invalid_iterator}, IS=#itr_state{itr=Itr,
                                                  acc_fun=F,
                                                  segment_acc=Acc,
                                                  final_acc=FinalAcc}, 
-        State = #state{itr_filter_fun = ItrFilterFun}) ->
+        State = #state{itr_filter_fun = _ItrFilterFun}) ->
     case Segments of
         [] ->
             IS;
