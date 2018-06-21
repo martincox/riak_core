@@ -698,6 +698,7 @@ del_bucket(Level, Bucket, State) ->
 
 -spec new_segment_store(proplist(), hashtree()) -> hashtree().
 new_segment_store(Opts, State) ->
+    ItrFilterFun = proplists:get_value(itr_filter_fun, Opts, undefined),
     DataDir = case proplists:get_value(segment_path, Opts) of
                   undefined ->
                       Root = "/tmp/anti/level",
@@ -729,11 +730,11 @@ new_segment_store(Opts, State) ->
 
     ok = filelib:ensure_dir(DataDir),
     {ok, Ref} = eleveldb:open(DataDir, Options),
-    State#state{ref=Ref, path=DataDir}.
+    State#state{ref=Ref, path=DataDir, itr_filter_fun=ItrFilterFun}.
 
 -spec share_segment_store(hashtree(), hashtree()) -> hashtree().
-share_segment_store(State, #state{ref=Ref, path=Path}) ->
-    State#state{ref=Ref, path=Path}.
+share_segment_store(State, #state{ref=Ref, path=Path, itr_filter_fun = ItrFilterFun}) ->
+    State#state{ref=Ref, path=Path, itr_filter_fun=ItrFilterFun}.
 
 -spec hash(term()) -> empty | binary().
 hash([]) ->
