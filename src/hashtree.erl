@@ -1049,7 +1049,10 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                   _ ->
                       CurSeg
               end,
-    KVAcc = ItrFilterFun(K, V, State),
+    KVAcc = case ItrFilterFun of
+                undefined -> [K, V];
+                _ -> ItrFilterFun(K, V, State)
+            end,
     case {SegId, Seg, Segments, IS#itr_state.prefetch} of
         {bad, -1, _, _} ->
             %% Non-segment encountered, end traversal
