@@ -1050,7 +1050,7 @@ iterate({ok, K, V}, IS=#itr_state{itr=Itr,
                       CurSeg
               end,
     KVAcc = case ItrFilterFun of
-                undefined -> [K, V];
+                undefined -> [{K, V}];
                 _ -> ItrFilterFun(K, V, State)
             end,
     case {SegId, Seg, Segments, IS#itr_state.prefetch} of
